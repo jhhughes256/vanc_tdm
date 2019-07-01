@@ -85,15 +85,15 @@ $MAIN  // Covariate Effects
   double Q = TVQ;
 
   // Infusion Duration (hours)
-  if(EVID == 1) last_dose = self.amt;
-  if(ceil(last_dose/1000) <= 1) {
-    D_CENT = 60/60;
-  } else if(ceil(last_dose/1500) <= 1) {
-    D_CENT = 90/60;
-  } else if(ceil(last_dose/2000) <= 1) {
-    D_CENT = 120/60;
-  } else {
-    D_CENT = self.amt/1000;
+  if(EVID == 1) last_dose = self.amt;  // capture latest dose
+  if(ceil(last_dose/1000) <= 1) {  // if dosage is less than or equal to 1g
+    D_CENT = 60/60;  // set infusion time to 60 minutes
+  } else if(ceil(last_dose/1500) <= 1) {  // if dosage less than or equal to 1.5g
+    D_CENT = 90/60;  // set infusion time to 90 minutes
+  } else if(ceil(last_dose/2000) <= 1) {  // if dosage less than or equal to 2g
+    D_CENT = 120/60;  // set infuison time to 120 minutes
+  } else {  // if infusion time more than 2g
+    D_CENT = self.amt/1000;  // set infusion time to 1g/hour
   }
 
 $ODE  // Differential Equations

@@ -87,22 +87,23 @@
     tibble::as_tibble()
   
 # Save data as .RDS for later use
-  saveRDS(output_tb, "output/vanc_induction.rds")
+  readr::write_rds(pop_tb, path = "output/vanc_population.rds")
+  readr::write_rds(output_tb, path = "output/vanc_induction.rds")
   
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 # Plot patient data
 # Set ggplot2 theme
-  theme_bw2 <- theme_set(theme_bw(base_size = 14))
-  theme_update(plot.title = element_text(hjust = 0.5))
+  # theme_bw2 <- theme_set(theme_bw(base_size = 14))
+  # theme_update(plot.title = element_text(hjust = 0.5))
 
 # Plot individual patient vancomycin concentrations
-  p <- NULL
-  p <- ggplot(data = output_tb)
-  p <- p + stat_summary(aes(x = time, y = IPRE), geom = "line", fun.y = median, 
-    colour = "red", size = 1)
-  p <- p + stat_summary(aes(x = time, y = IPRE), geom = "ribbon", 
-    fun.ymin = CI90lo,  fun.ymax = CI90hi, fill = "red", size = 1, alpha = 0.25)
-  p <- p + labs(x = "Time (hours)", y = "Caffeine Concentration (mg/L)")
-  p <- p + coord_cartesian(xlim = c(0, 72), ylim = NULL)
-  p <- p + facet_wrap(~CRCL)
-  p
+  # p <- NULL
+  # p <- ggplot(data = output_tb)
+  # p <- p + stat_summary(aes(x = time, y = IPRE), geom = "line", fun.y = median,
+  #   colour = "red", size = 1)
+  # p <- p + stat_summary(aes(x = time, y = IPRE), geom = "ribbon",
+  #   fun.ymin = CI90lo,  fun.ymax = CI90hi, fill = "red", size = 1, alpha = 0.25)
+  # p <- p + labs(x = "Time (hours)", y = "Vancomycin Concentration (mg/L)")
+  # p <- p + coord_cartesian(xlim = c(0, 72), ylim = NULL)
+  # p <- p + facet_wrap(~CRCL)
+  # p
