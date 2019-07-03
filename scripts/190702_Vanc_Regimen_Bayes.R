@@ -1,7 +1,9 @@
-# Nivolumab PK Model with Tumour Growth - TDM Step-wise Dosing
+# Vancomycin Dose-Adjustment Regimen - Bayesian Optimised Dosing Regimen
 # -----------------------------------------------------------------------------
-# Simulation of dosing 240 mg every 2 weeks initially, before using TDM with
-#   proportional dosage changes.
+# Takes induction dataset and changes the dosage after the time when the first
+#   blood sample would be taken. Uses empirical bayesian estimation to 
+#   determine patient pharmacokinetic characteristics. This is then used to
+#   determine the best dose for the patient.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 # Clear workspace
   rm(list=ls(all=TRUE))
@@ -18,13 +20,11 @@
 
 # Source PopPK model script
   source("scripts/functions_utility.R")  # functions utility
-  source("scripts/190320_Nivo_Induction.R")  # induction data
-  # sourcing of induction data sources model and population
-  # this will be swapped for one script sourcing all scripts for final run
-  dose_interval <- 14
-  dose_min <- 40
-  dose_max <- 800
-  dose_opts <- c(40, seq(80, 800, by = 20))
+  source("models/vanc_pk.R")  # PK model
+  
+# Read .rds files for population, input and induction datasets
+  pop_tb <- readr::read_rds("output/vanc_population.rds")
+  input_tb <- readr::read_rds("output/vanc_induction.rds")
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
   bayes_fn <- function(induction_tb) {
@@ -48,69 +48,197 @@
     bayesin_tb <- induction_tb
   # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
   # Begin loop for successive dose adjustment
+    sample_all <- c(NULL)
     repeat {
-      browser()
     # Determine sample time and sample concentration based on the designated
     #   sample number assigned initially, or after dose adjustment.
       sample_time <- dplyr::filter(bayesin_tb, evid != 0) %>%
         dplyr::slice(dose_num) %>%
         dplyr::pull(time)
-      sample_conc <- dplyr::filter(bayesin_tb, time == sample_time) %>%
-        dplyr::pull(DV)
+      sample_all <- c(sample_all, sample_time)
+      # sample_conc <- dplyr::filter(bayesin_tb, time == sample_time) %>%
+      #   dplyr::pull(DV)
     # Determine previous dose and frequency
       last_amt <- dplyr::filter(bayesin_tb, time == sample_time) %>%
         dplyr::pull(amt)
       last_frq <- dplyr::filter(bayesin_tb, evid != 0 & time >= sample_time) %>%
         dplyr::pull(time) %>% diff() %>% unique()
     # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
-    # Determine what the dose should be for future dose times based on patient 
-    #   AUC0-24 prior to the dose adjustment time.
-    # First determine the AUC for the previous 24 hours.
-      linear_auc24_fn <- function(data) {
-      # Prepare function environment
-        Ct1 <- head(data$DV, -1)
-        Ct2 <- tail(data$DV, -1)
-        h <- diff(data$time)
-      # Calculate AUC
-        auc <- sum((Ct1 + Ct2)*h/2)
-      }
-      auc24_val <- bayesin_tb %>% 
-        dplyr::filter(time <= sample_time & time >= (sample_time - 24)) %>%
-        linear_auc24_fn()
-    # Then determine whether it is within the range. If it, keep the dose the
-    #   the same. If it's outside, proportionally change the dose to achieve
-    #   500 mg.h/L.
-      if (auc24_val >= 400 & auc24_val <= 550) {
+    # Empirical Bayesian Estimation
+    # Loop until successful minimisation
+      run_num <- 0
+      sample_tb <- bayesin_tb %>%
+        dplyr::filter(evid == 1) %>%
+        dplyr::mutate(DV = dplyr::if_else(time %in% sample_all, DV, NA_real_))
+      repeat {
+      # Initial estimates for Bayes parameters
+        ETABSV <- mrgsolve::omat(mod, make = TRUE) %>% diag()
+        n_eta <- length(ETABSV)
+        mod_etas <- 1:n_eta
+        init_par <- exp(double(n_eta))
+        if (run_num > 0) {
+          init_par <- init_par*exp(runif(n_eta, min = -0.01, max = 0.01))
+        }
+      # Previous dependent variable values
+        prev_DV <- dplyr::filter(bayesin_tb, time %in% sample_all) %>% 
+          dplyr::pull(DV)
+      # Define bayesian estimation function
+        bayes_estimate_fn <- function(par) {
+        # Describe parameters to be optimised within mrgsolve data set
+          ETA <- log(par)
+        # Define mrgsolve dataset
+          estim_tb <- bayesin_tb %>%
+            dplyr::select(ID, time, evid, amt, cmt, rate, WT, DIAL, CRCL) %>%
+            dplyr::mutate_at(paste0("ETA", mod_etas), function(x) {
+              eta <- as.numeric(substr(deparse(substitute(x)), 4, 4))
+              which_eta <- which(mod_etas == eta)
+              ETA[which_eta]
+            }) %>%
+          # Run data through mrgsolve, with idata using initial tumour size
+            mrgsolve::data_set(x = mod, data = .) %>%
+            mrgsolve::carry_out(amt, evid, rate, cmt) %>% 
+            mrgsolve::mrgsim() %>%
+            tibble::as_tibble() %>% 
+          # Ensure IPRED has finite values
+            dplyr::mutate(IPRE = dplyr::if_else(
+              !is.finite(IPRE) | IPRE < .Machine$double.eps,
+              .Machine$double.eps,
+              IPRE
+            ))
+        # Define yhat
+          yhat <- dplyr::filter(estim_tb, time %in% sample_all) %>%
+            dplyr::pull(IPRE)
+        # Posterior log-likelihood
+        # Error model: IPRE*(1 + ERR_PRO) + ERR_ADD
+        # Can be simplified to: IPRE + W*ERR
+        # Where W = sqrt(pow(IPRE*ERR_PRO, 2) + pow(ERR_ADD, 2))
+          loglikpost_sd <- sqrt((yhat*mod$ERR_PRO)^2 + mod$ERR_ADD^2)
+          loglikpost <- dnorm(prev_DV, mean = yhat, sd = loglikpost_sd, log = T)
+        # Prior log-likelihood
+          loglikprior <- dnorm(ETA, mean = 0, sd = sqrt(ETABSV[mod_etas]), log = T)
+        # Return objective function value to be minimised
+          return(-1*sum(loglikpost, loglikprior))
+        }  # end bayes_estimate_fn
+      # Run bayes_estimate_fn using optim()
+        bayes_estimate <- try(optim(init_par, bayes_estimate_fn, method = "L-BFGS-B",
+          lower = rep(0.001, times = n_eta), upper = rep(1000, times = n_eta),
+          control = list(
+            parscale = init_par, fnscale = bayes_estimate_fn(init_par),
+            factr = 1e12, pgtol = 1e-8
+          )
+        ))
+        if (class(bayes_estimate) == "try-error") browser()  # error catch
+        minimised <- "CONVERGENCE: REL_REDUCTION_OF_F <= FACTR*EPSMCH"
+        if (bayes_estimate$message == minimised) break
+        run_num <- run_num + 1
+      }  # end loop as successful minimisation has occurred
+    # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    # Calculate concentrations according to new Bayes estimates.
+      input_sim_tb <- bayesin_tb %>%
+        dplyr::select(ID, time, evid, amt, cmt, rate, WT, DIAL, CRCL) %>%
+        dplyr::mutate_at(paste0("ETA", mod_etas), function(x) {
+          eta <- as.numeric(substr(deparse(substitute(x)), 4, 4))
+          which_eta <- which(mod_etas == eta)
+          log(bayes_estimate$par[which_eta])
+        })
+      output_sim_tb <- input_sim_tb %>%
+        dplyr::filter(time <= sample_time) %>%
+        mrgsolve::data_set(x = mod, data = .) %>%
+        mrgsolve::carry_out(amt, evid, rate, cmt) %>% 
+        mrgsolve::mrgsim() %>%
+        tibble::as_tibble()
+    # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    # Optimise dose for the individual using individual Bayes predicted 
+    #   concentrations (and compartment amounts) at time of last sampling.
+    #   Only optimise if the AUC0-24 for the last day is outside of the target
+    #   range.
+    # Determine AUC over the last 24 hours then define when next sample occurs
+      last_bayes_auc <- output_sim_tb %>%
+        dplyr::filter(time %in% c(sample_time - 24, sample_time)) %>%
+        dplyr::pull(AUC) %>% diff()
+      sample_next <- dplyr::if_else(last_bayes_auc >= 800, 24, 72)
+      next_time <- sample_time + sample_next
+    # Define trough target and upper bound, begin if statement
+      auc_lower <- 400
+      auc_target <- 500
+      auc_upper <- 550
+      if (last_bayes_auc < auc_lower | last_bayes_auc >= auc_upper | last_amt == 0) {
+      # Modify model code ready for simulation
+        optim_mod <- mrgsolve::init(mod, list(
+          CENT = dplyr::filter(output_sim_tb, time == sample_time) %>% 
+            dplyr::pull(CENT),
+          PERI = dplyr::filter(output_sim_tb, time == sample_time) %>% 
+            dplyr::pull(PERI),
+          AUC = dplyr::filter(output_sim_tb, time == sample_time) %>% 
+            dplyr::pull(AUC)
+        ))
+      # Set initial dose and error estimates
+        init_par <- c(1000, 0.01)
+        prev_frq <- dplyr::if_else(last_amt == 0, 12, last_frq)
+        repeat{
+        # Subset input dataset so only future concentrations are predicted
+          test_times <- seq(sample_time, final_time, by = prev_frq)
+          input_optim_tb <- input_sim_tb %>% 
+            dplyr::filter(time >= sample_time & time <= next_time) %>%
+            dplyr::mutate(
+              evid = dplyr::if_else(time %in% test_times, 1, 0),
+              rate = dplyr::if_else(evid != 0, -2, 0)
+            )
+        # Find the doses that maximise the likelihood of trough concentrations
+        #   being the target concentration
+          optimise_dose_fn <- function(par) {
+          # Add fitted parameters to the input data set, then simulate 
+          #   concentration-time profiles with fitted doses
+            output_optim_tb <- input_optim_tb %>%
+              dplyr::mutate(amt = dplyr::if_else(
+                evid == 1, par[1], amt
+              )) %>%
+              mrgsolve::data_set(x = optim_mod, data = .) %>%
+              mrgsolve::carry_out(amt, evid, rate, cmt) %>% 
+              mrgsolve::mrgsim(start = sample_time, end = next_time) %>%
+              tibble::as_tibble() %>%
+              dplyr::mutate(IPRE = dplyr::if_else(
+                !is.finite(IPRE) | IPRE < .Machine$double.eps,
+                .Machine$double.eps,
+                IPRE
+              ))
+          # Define yhat and the residual
+            yhat <- output_optim_tb %>%
+              dplyr::filter(time %in% c(next_time - 24, next_time)) %>%
+              dplyr::pull(AUC) %>% diff()
+            res <- dnorm(auc_target, yhat, yhat*par[2], log = T)
+          # Objective function value to be minimised
+            return(-1*sum(res))
+          }
+          optimise_dose <- try(optim(init_par, optimise_dose_fn, method = "L-BFGS-B",
+            lower = c(0.0001, 0.0001),
+            upper = c(5000, Inf),
+            control = list(parscale = init_par, factr = 1e7)
+          ))
+          if (class(optimise_dose) == "try-error") browser()  # error catch
+        # Administer the individual the optimised dose
+          exact_amt <- optimise_dose$par[1]
+          if (exact_amt >= 500 | exact_amt <= 2000) {
+            dose_frq <- prev_frq
+            if (exists("pls_stop_later")) browser()  # exception
+            break
+          }
+          frq_list <- c(6, 8, 12, 24)
+          frq_num <- which(frq_list == prev_frq) - ifelse(exact_amt < 500, -1, 1)
+          prev_frq <- frq_list[frq_num]
+          pls_stop_later <- 1  # test
+          browser()  # exception
+        }  # end repeat
+        if (exact_amt < 1) exact_amt <- 0
+        dose_amt <- ceiling(exact_amt/250)*250
+      } else {
+      # Give previous dose
         dose_amt <- last_amt
         dose_frq <- last_frq
-      } else {
-        auc24_target <- 400
-        exact_amt <- last_amt*auc24_target/auc24_val
-        dose_amt <- ceiling(exact_amt/250)*250  # round to closest 250 mg
-    # If dose is not within 0.5 - 1.5 g consider changing dosing frequency
-        if (dose_amt >= 500 & dose_amt <= 2000) {
-          dose_frq <- last_frq
-        } else {
-          frq_list <- c(6, 8, 12, 24)
-          prev_frq <- last_frq
-          repeat{
-            frq_num <- which(frq_list == prev_frq) - ifelse(dose_amt < 500, -1, 1)
-            if (frq_num %in% 1:length(frq_list)) {
-              dose_frq <- frq_list[frq_num]
-              exact_amt <- dose_amt*dose_frq/prev_frq
-              dose_amt <- ceiling(exact_amt/250)*250  # round to closest 250 mg
-            } else {
-              dose_frq <- prev_frq
-            }
-            if (dose_frq == prev_frq | (dose_amt >= 500 & dose_amt <= 2000)) break
-            prev_frq <- dose_frq
-          }
-        }
-      }
-    # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    # Set dose and simulate concentration that result from the dose adjustment.
+      }  # end if at target auc
+    # Check to see if dose change is required
       if (dose_frq == last_frq & dose_amt == last_amt) {
-        mrginput_tb <- bayesin_tb %>%
+        input_final_tb <- bayesin_tb %>%
           dplyr::select(ID, time, evid, amt, cmt, rate, EPS1, EPS2)
       } else {
         dose_times <- seq(sample_time, final_time, by = dose_frq)
@@ -120,22 +248,23 @@
             amt = dplyr::if_else(evid == 1, dose_amt, 0),
             rate = dplyr::if_else(amt != 0, -2, 0)
           )
-        mrginput_tb <- dplyr::filter(bayesin_tb, time < sample_time) %>%
+        input_final_tb <- dplyr::filter(bayesin_tb, time < sample_time) %>%
           dplyr::bind_rows(adjusted_tb) %>%
           dplyr::select(ID, time, evid, amt, cmt, rate, EPS1, EPS2)
       }
-    # Simulate new trough concentrations
+    # Simulate to represent time passing since last sample
       bayesout_tb <- mod %>%
-        mrgsolve::data_set(mrginput_tb) %>%
-        mrgsolve::idata_set(pop_tb) %>%
-        mrgsolve::carry_out(amt, evid, rate, cmt) %>% 
+        mrgsolve::data_set(data = input_final_tb) %>%
+        mrgsolve::idata_set(data = pop_tb) %>%
+        mrgsolve::carry_out(amt, evid, rate, cmt) %>%
         mrgsolve::mrgsim() %>%
-        tibble::as_tibble() 
+        tibble::as_tibble()
     # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     # Determine when the next blood sample should be taken. If dose was held
     #   next blood sample should be in 24 hours. Otherwise, next sample should
     #   be in 72 hours.
-      sample_next <- dplyr::if_else(auc24_val >= 800, 24, 72)
+    # This is done above as it impacts dosing optimisation
+      # sample_next <- dplyr::if_else(auc24_val >= 800, 24, 72)
       dose_num <- dose_num + sample_next/dose_frq
       if (dose_num >= dim(dplyr::filter(bayesout_tb, evid != 0))[1]) break
       bayesin_tb <- bayesout_tb
@@ -144,12 +273,75 @@
   }  # brackets closing "bayes_fn"
   
   tictoc::tic()
-  output_tdmstep_df <- trough_flat_df %>%
-    dplyr::filter(ID %in% 1:100) %>%
+  output_tb <- input_tb %>%
+    # dplyr::filter(ID %in% c(1:100, 1001:1100, 2001:2100, 3001:3100)) %>%
   { tibble::add_column(., ID2 = .$ID) } %>%  # so that ID is carried inside of the nest structure
     dplyr::group_by(ID) %>% tidyr::nest() %>%  # create list column for ID data
-    dplyr::mutate(bayes = purrr::map(data, TDMstep_fn))  # create new list column using bayes_fn
+    dplyr::mutate(bayes = purrr::map(data, bayes_fn))  # create new list column using bayes_fn
   tictoc::toc() 
     
-  readr::write_rds(output_tdmstep_df, path = "output/stepwise_tdm.rds")
+  readr::write_rds(output_tb, path = "output/vanc_regimen_bayes.rds")
+  
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+# Plot patient data
+# Set ggplot2 theme
+  theme_bw2 <- theme_set(theme_bw(base_size = 14))
+  theme_update(plot.title = element_text(hjust = 0.5))
+  
+# Set palette
+  cbPalette <- data.frame(
+		grey = "#999999",
+		orange = "#E69F00",
+		skyblue = "#56B4E9",
+		green = "#009E73",
+		yellow = "#F0E442",
+		blue = "#0072B2",
+		red = "#D55E00",
+		pink = "#CC79A7",
+		stringsAsFactors = F
+	)
+  
+# Plot median patient vancomycin concentrations with 90% confidence intervals
+  plot_tb <- dplyr::select(output_tb, ID, bayes) %>%
+    tidyr::unnest()
+  p <- NULL
+  p <- ggplot(data = plot_tb)
+  p <- p + stat_summary(aes(x = time, y = IPRE), geom = "line", fun.y = median,
+    colour = "red", size = 1)
+  p <- p + stat_summary(aes(x = time, y = IPRE), geom = "ribbon",
+    fun.ymin = CI90lo,  fun.ymax = CI90hi, fill = "red", size = 1, alpha = 0.25)
+  p <- p + labs(x = "Time (hours)", y = "Vancomycin Concentration (mg/L)")
+  p <- p + coord_cartesian(xlim = c(0, 168), ylim = NULL)
+  p <- p + facet_wrap(~CRCL)
+  p
+  
+# Plot % patients with AUC > 400 mg.h/L
+  auc_tb <- dplyr::filter(plot_tb, time %in% (0:7*24)) %>%
+    dplyr::group_by(ID) %>% tidyr::nest() %>%
+    dplyr::mutate(data = purrr::map(data, function(data) {
+      dplyr::mutate(data, dAUC = c(0, diff(AUC)))
+    })) %>% tidyr::unnest() %>%
+    dplyr::filter(time != 0) %>%
+    dplyr::mutate(time = time/24)
+  
+  auc_target_bycrcl <- auc_tb %>%
+    dplyr::group_by(time, CRCL) %>% tidyr::nest() %>%
+    dplyr::mutate(data = purrr::map(data, function(data) {
+      tibble::tibble(
+        gt400 = sum(data$dAUC > 400)/dim(data)[1],
+        gt700 = sum(data$dAUC > 700)/dim(data)[1]
+      )
+    })) %>% tidyr::unnest()
+  
+  p <- NULL
+  p <- ggplot(data = auc_target_bycrcl)
+  p <- p + geom_line(aes(x = time, y = gt400*100),
+    size = 1, colour = cbPalette$green)
+  p <- p + geom_line(aes(x = time, y = gt700*100),
+    size = 1, colour = cbPalette$red)
+  p <- p + scale_x_continuous("Time (days)", breaks = 0:7)
+  p <- p + scale_y_continuous("IPRE AUC24 > Target AUC24 (%)")
+  p <- p + coord_cartesian(xlim = NULL, ylim = c(0, 100))
+  p <- p + facet_wrap(~CRCL)
+  p
   

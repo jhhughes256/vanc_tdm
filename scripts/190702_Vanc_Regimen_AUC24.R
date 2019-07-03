@@ -129,9 +129,9 @@
         mrgsolve::mrgsim() %>%
         tibble::as_tibble() 
     # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    # Determine when the next blood sample should be taken. If dose was held
-    #   next blood sample should be in 24 hours. Otherwise, next sample should
-    #   be in 72 hours.
+    # Determine when the next blood sample should be taken. If dose resulted in
+    #   an AUC >= 800, then the next sample should in 24 hours. Otherwise, 
+    #   next sample should be in 72 hours.
       sample_next <- dplyr::if_else(auc24_val >= 800, 24, 72)
       dose_num <- dose_num + sample_next/dose_frq
       if (dose_num >= dim(dplyr::filter(ncaout_tb, evid != 0))[1]) break
