@@ -47,7 +47,7 @@
     dplyr::select(ID, bayes) %>% tidyr::unnest() %>%
     tibble::add_column(method = "auc24")
   
-  bayes_tb <- readr::read_rds("output/vanc_regimen_bayes.rds") %>%
+  bayes_tb <- readr::read_rds("output/vanc_regimen_bayes_fix.rds") %>%
     dplyr::select(ID, bayes) %>% tidyr::unnest() %>%
     tibble::add_column(method = "bayes")
 
@@ -159,55 +159,106 @@
 # Plot % patients with AUC > Target
   p <- NULL
   p <- ggplot(data = dplyr::filter(auc_target_bycrcl, method == "sagov"))
-  p <- p + ggtitle("Percent Patients above 400 and 700 mg.h/L - SA Health Guidelines")
+  p <- p + ggtitle("Probability of Target Attainment - SA Health Guidelines")
   p <- p + geom_line(aes(x = time, y = gt400*100),
     size = 1, colour = cbPalette$green)
   p <- p + geom_line(aes(x = time, y = gt700*100),
     size = 1, colour = cbPalette$red)
+  p <- p + geom_line(aes(x = time, y = gt400lt700*100),
+    size = 1, colour = cbPalette$blue)
   p <- p + scale_x_continuous("\nTime (days)", breaks = 0:7)
-  p <- p + scale_y_continuous("Patient AUC > Target AUC (%)\n")
+  p <- p + scale_y_continuous("Probability of Target Attainment (%)\n")
   p <- p + coord_cartesian(xlim = NULL, ylim = c(0, 100))
   p2_sagov <- p + facet_wrap(~CRCLf)
   p2_sagov
   
   p <- NULL
   p <- ggplot(data = dplyr::filter(auc_target_bycrcl, method == "auc24"))
-  p <- p + ggtitle("Percent Patients above 400 and 700 mg.h/L - Proportional TDM")
+  p <- p + ggtitle("Probability of Target Attainment - Proportional TDM")
   p <- p + geom_line(aes(x = time, y = gt400*100),
     size = 1, colour = cbPalette$green)
   p <- p + geom_line(aes(x = time, y = gt700*100),
     size = 1, colour = cbPalette$red)
+  p <- p + geom_line(aes(x = time, y = gt400lt700*100),
+    size = 1, colour = cbPalette$blue)
   p <- p + scale_x_continuous("\nTime (days)", breaks = 0:7)
-  p <- p + scale_y_continuous("Patient AUC > Target AUC (%)\n")
+  p <- p + scale_y_continuous("Probability of Target Attainment (%)\n")
   p <- p + coord_cartesian(xlim = NULL, ylim = c(0, 100))
   p2_auc24 <- p + facet_wrap(~CRCLf)
   p2_auc24
   
   p <- NULL
   p <- ggplot(data = dplyr::filter(auc_target_bycrcl, method == "bayes"))
-  p <- p + ggtitle("Percent Patients above 400 and 700 mg.h/L - Model-Based TDM")
+  p <- p + ggtitle("Probability of Target Attainment - Model-Based TDM")
   p <- p + geom_line(aes(x = time, y = gt400*100),
     size = 1, colour = cbPalette$green)
   p <- p + geom_line(aes(x = time, y = gt700*100),
     size = 1, colour = cbPalette$red)
+  p <- p + geom_line(aes(x = time, y = gt400lt700*100),
+    size = 1, colour = cbPalette$blue)
   p <- p + scale_x_continuous("\nTime (days)", breaks = 0:7)
-  p <- p + scale_y_continuous("Patient AUC > Target AUC (%)\n")
+  p <- p + scale_y_continuous("Probability of Target Attainment (%)\n")
   p <- p + coord_cartesian(xlim = NULL, ylim = c(0, 100))
   p2_bayes <- p + facet_wrap(~CRCLf)
   p2_bayes
   
 # Plot % patients with AUC within Target Range
   p <- NULL
-  p <- ggplot(data = auc_target)
-  p <- p + ggtitle("Percent Patients within 400 - 700 mg.h/L - Comparison")
-  p <- p + geom_line(aes(x = time, y = gt400lt700*100, colour = methodf),
-    size = 1, alpha = 0.8)
+  p <- ggplot(data = dplyr::filter(auc_target, method == "sagov"))
+  p <- p + ggtitle("Probability of Target Attainment - SA Health Guidelines")
+  p <- p + geom_line(aes(x = time, y = gt400*100),
+    size = 1, colour = cbPalette$green)
+  p <- p + geom_line(aes(x = time, y = gt700*100),
+    size = 1, colour = cbPalette$red)
+  p <- p + geom_line(aes(x = time, y = gt400lt700*100),
+    size = 1, colour = cbPalette$blue)
   p <- p + scale_x_continuous("\nTime (days)", breaks = 0:7)
-  p <- p + scale_y_continuous("Patient AUC > Target AUC (%)\n")
-  p <- p + scale_colour_manual("TDM Method", values = palette)
-  p <- p + guides(colour = guide_legend(override.aes = list(alpha = 1)))
-  p3 <- p + coord_cartesian(xlim = NULL, ylim = c(0, 100))
-  p3
+  p <- p + scale_y_continuous("Probability of Target Attainment (%)\n")
+  p3_sagov <- p + coord_cartesian(xlim = NULL, ylim = c(0, 100))
+  p3_sagov
+  
+  p <- NULL
+  p <- ggplot(data = dplyr::filter(auc_target, method == "auc24"))
+  p <- p + ggtitle("Probability of Target Attainment - Proportional TDM")
+  p <- p + geom_line(aes(x = time, y = gt400*100),
+    size = 1, colour = cbPalette$green)
+  p <- p + geom_line(aes(x = time, y = gt700*100),
+    size = 1, colour = cbPalette$red)
+  p <- p + geom_line(aes(x = time, y = gt400lt700*100),
+    size = 1, colour = cbPalette$blue)
+  p <- p + scale_x_continuous("\nTime (days)", breaks = 0:7)
+  p <- p + scale_y_continuous("Probability of Target Attainment (%)\n")
+  p3_auc24 <- p + coord_cartesian(xlim = NULL, ylim = c(0, 100))
+  p3_auc24
+  
+  p <- NULL
+  p <- ggplot(data = dplyr::filter(auc_target, method == "bayes"))
+  p <- p + ggtitle("Probability of Target Attainment - Model-Based TDM")
+  p <- p + geom_line(aes(x = time, y = gt400*100),
+    size = 1, colour = cbPalette$green)
+  p <- p + geom_line(aes(x = time, y = gt700*100),
+    size = 1, colour = cbPalette$red)
+  p <- p + geom_line(aes(x = time, y = gt400lt700*100),
+    size = 1, colour = cbPalette$blue)
+  p <- p + scale_x_continuous("\nTime (days)", breaks = 0:7)
+  p <- p + scale_y_continuous("Probability of Target Attainment (%)\n")
+  p3_bayes <- p + coord_cartesian(xlim = NULL, ylim = c(0, 100))
+  p3_bayes
+  
+  p <- NULL
+  p <- ggplot(data = auc_target)
+  p <- p + ggtitle("Probability of Target Attainment - Model-Based TDM")
+  p <- p + geom_line(aes(x = time, y = gt400*100),
+    size = 1, colour = cbPalette$green)
+  p <- p + geom_line(aes(x = time, y = gt700*100),
+    size = 1, colour = cbPalette$red)
+  p <- p + geom_line(aes(x = time, y = gt400lt700*100),
+    size = 1, colour = cbPalette$blue)
+  p <- p + scale_x_continuous("\nTime (days)", breaks = 0:7)
+  p <- p + scale_y_continuous("Probability of Target Attainment (%)\n")
+  p <- p + coord_cartesian(xlim = NULL, ylim = c(0, 100))
+  p3_all <- p + facet_wrap(~ methodf, nrow = 1)
+  p3_all
   
   p1_sagov
   ggsave("output/CvT_sagov.png", width = 8, height = 6)
@@ -215,14 +266,25 @@
   ggsave("output/CvT_auc24.png", width = 8, height = 6)
   p1_bayes
   ggsave("output/CvT_bayes.png", width = 8, height = 6)
+  # ggsave("output/CvT_bayes_addsamp.png", width = 8, height = 6)
   p1_all
   ggsave("output/CvT_all.png", width = 8, height = 6)
+  # ggsave("output/CvT_all_addsamp.png", width = 8, height = 6)
   p2_sagov
-  ggsave("output/AUC_abovetarget_sagov.png", width = 8, height = 6)
+  ggsave("output/AUC_bycrcl_sagov.png", width = 8, height = 6)
   p2_auc24
-  ggsave("output/AUC_abovetarget_auc24.png", width = 8, height = 6)
+  ggsave("output/AUC_bycrcl_auc24.png", width = 8, height = 6)
   p2_bayes
-  ggsave("output/AUC_abovetarget_bayes.png", width = 8, height = 6)
-  p3
-  ggsave("output/AUC_range_all.png", width = 8, height = 6)
+  ggsave("output/AUC_bycrcl_bayes.png", width = 8, height = 6)
+  # ggsave("output/AUC_bycrcl_bayes_addsamp.png", width = 8, height = 6)
+  p3_sagov
+  ggsave("output/AUCtarget_sagov.png", width = 8, height = 6)
+  p3_auc24
+  ggsave("output/AUCtarget_auc24.png", width = 8, height = 6)
+  p3_bayes
+  ggsave("output/AUCtarget_bayes.png", width = 8, height = 6)
+  # ggsave("output/AUCtarget_bayes_addsamp.png", width = 8, height = 6)
+  p3_all
+  ggsave("output/AUCtarget_all.png", width = 8, height = 6)
+  # ggsave("output/AUCtarget_all_addsamp.png", width = 8, height = 6)
   
