@@ -314,6 +314,8 @@
   p3_all
   p3_all_square
   
+  # levels(auc_target$methodf)[4] <- "Model-Based w/ Load"
+  
   p1_sagov
   ggsave("output/CvT_sagov.png", width = 8, height = 6)
   p1_auc24

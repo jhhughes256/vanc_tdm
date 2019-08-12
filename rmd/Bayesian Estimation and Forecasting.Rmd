@@ -1,0 +1,1055 @@
+---
+title: "Bayesian Estimation and Forecasting"
+author: "Jim Hughes"
+date: "12 August 2019"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Aim
+
+This document aims to provide a workflow for empirical Bayesian estimation and
+Bayesian forecasting using the `mrgsolve` package in R. Each step covered is
+accompanied by an example script. The steps covered by this manuscript are:
+
+* Simulation of "observed data" using `mrgsolve`
+* Utilising empirical Bayesian estimation to obtain individual pharmacokinetic
+parameters
+* Utilising Bayesian forecasting for dose optimisation
+
+## Overview
+
+For a given set of observed pharmacokinetic data for which there is an existing
+population pharmacokinetic model, the individual pharmacokinetic parameters
+(clearance, CL; volume of distribution, Vd etc.) can be obtained using empirical
+Bayesian estimation. These individual parameters are also known as empirical
+Bayesian estimates (EBEs). 
+
+Software such as NONMEM provide EBEs as a part of 
+it's post-hoc analysis. While this is often considered the easiest way to get 
+EBEs, there are cases where the use of NONMEM is not practical, feasible or 
+optimal. Fortunately, EBEs can be obtained using R, by utilising packages such as 
+`mrgsolve`, `RxODE`, `deSolve` and `PKADVAN`. 
+
+Bayesian forecasting is a method of extrapolating from observed data to predict
+future events. With pharmacokinetic data, this is done to predict patient
+exposure after given certain doses with the aim of optimising that dose to
+maximise efficacy and minimise toxicity. Bayesian forecasting uses EBEs to make
+it's predictions.
+
+### R Packages
+
+The three differential equation solver packages `mrgsolve`, `RxODE` and 
+`deSolve` allow the user to define any model, while `PKADVAN` is limited to the 
+pre-defined model types within the package due to it's use of analytical 
+solutions. The requirement of an R tools installation for `mrgsolve` and `RxODE` 
+may cause difficulties on some systems, making `deSolve` and `PKADVAN` easier to
+use with little setup required. While `mrgsolve`, `RxODE` and `PKADVAN` work 
+using similar datasets and workflows to those seen in NONMEM, while `deSolve`
+is structured somewhat differently making it's use less intuitive for NONMEM
+users.
+
+In this document R version 3.4.4 was used with the following packages:
+
+* `mrgsolve` ver. 0.9.1
+* `dplyr` ver. 0.8.1
+* `tibble` ver. 2.1.1
+* `MASS` ver. 7.3.51.4
+* `ggplot2` ver. 3.1.1
+* `purrr` ver. 0.3.2
+* `plyr` ver. 1.8.4
+
+## Observed Data
+
+The observed data used to obtain EBEs will need to be in a long-format (also
+known as NONMEM-format), as typically used in NONMEM. This data format describes
+in each row, data that describes the dose and concentrations at each time. For 
+this document, an example dataset will be simulated.
+
+Simulating observed data requires:
+
+* a population pharmacokinetic model
+* a description of the population of interest
+* a drug regimen describing dose and concentration times
+
+These three components are defined as three separate files in the example files.
+The `regimen.R` R script reads in both the model and population before simulating
+concentrations according to the defined regimen.
+
+### Population Pharmacokinetic Model
+
+Population pharmacokinetic models defined for use with `mrgsolve` are layed out
+in a fashion similar to NONMEM. Information on `mrgsolve` model definition can
+be found in the user guide found at https://mrgsolve.github.io/user_guide/.
+
+The following model is a vancomycin population pharmacokinetic model by Goti
+et al. (reference below), which uses infusion times that are dependent on 
+patient dose as specified by the Clinical Practice Guideline for vancomycin
+dosing that is used by SA Health hospitals. This can be found at:
+https://www.sahealth.sa.gov.au/wps/wcm/connect/public+content/sa+health+internet/resources/policies/dosing+and+monitoring+of+vancomycin+in+adults+-+clinical+practice+guideline
+
+> Goti V, Chaturvedula A, Fossler MJ, Mok S, Jacob JT. Hospitalized Patients 
+With and Without Hemodialysis Have Markedly Different Vancomycin 
+Pharmacokinetics: A Population Pharmacokinetic Model-Based Analysis. Ther 
+Drug Monit. 2018;40(2):212-221.
+
+In the model definition of the population parameter 
+variability (ETA samples from the OMEGA distribution) are defined
+externally. This is required for empirical Bayesian estimation. 
+
+```{r pkmod}
+# Vancomycin Population Pharmacokinetic Model - Goti et al.
+# ------------------------------------------------------------------------------
+# Load libraries
+  library(dplyr)
+  library(mrgsolve)
+
+# Define model code
+  code <- '
+$INIT  // Initial Conditions for Compartments
+  CENT = 0,  // Central compartment
+  PERI = 0,  // Peripheral compartment
+  AUC = 0,  // Area under the curve
+
+$SET  // Set Differential Equation Solver Options			
+  atol = 1e-8, rtol = 1e-8
+  maxsteps = 100000
+
+$PARAM  // Population parameters
+  TVCL = 4.5,  // clearance (L/h)
+  TVVC = 58.4,  // central volume of distribution (L)
+  TVVP = 38.4,  // peripheral volume of distribution (L)
+  TVQ = 6.5,  // inter-compartmental clearance (L/h)
+
+  AVBWT = 70,  // average body weight (kg)
+  AVCRCL = 120,  // average creatinine clearance (mL/min)
+
+  // Covariate Effects
+  CL_CRCL = 0.8,  // creatinine clearance on clearance
+  CL_DIAL = 0.7,  // haemodialysis on clearance
+  VC_DIAL = 0.5,  // haemodialysis on volume of distribution
+
+  // Residual Variability
+  ERR_PRO = 0.227,  // proportional error (fraction)
+  ERR_ADD = 3.4,  // additive error (mg/L)
+
+  // Default Covariate Values for Simulation
+  WT = 79,  // body weight (kg)
+  CRCL = 62,  // creatinine clearance (mL/min)
+  DIAL = 0,  // haemodialysis status (0 - not on dialysis; 1 - on dialysis)
+
+  // Default ETA Values for Simulation
+  // Allocated in population so set to zero
+  ETA1 = 0,  // PPVCL
+  ETA2 = 0,  // PPVVC
+  ETA3 = 0,  // PPVVP
+
+  // Default EPS values for simulation
+  // Allocated in population so set to zero
+  EPS1 = 0,  // RUVPRO
+  EPS2 = 0,  // RUVADD
+
+$OMEGA  // Population parameter Variability
+  name = "omega1"
+  block = FALSE
+  0.158404  // PPVCL
+  0.665856  // PPVVC
+  0.326041  // PPVVP
+
+$SIGMA  // Residual Unexplained Variability	
+  block = FALSE
+  1  // RUVPRO
+  1  // RUVADD
+
+$PREAMBLE  // Set up C++ Environment to Capture Last Dose
+  double last_dose = 0;
+
+$MAIN  // Covariate Effects
+  double COVCL = TVCL*pow(CRCL/120, CL_CRCL)*pow(CL_DIAL, DIAL);
+  double COVVC = TVVC*pow(WT/70, 1)*pow(VC_DIAL, DIAL);
+
+  // Individual Parameter Values
+  double CL = COVCL*exp(ETA1);  // *exp(ETA(1))
+  double VC = COVVC*exp(ETA2);  // *exp(ETA(2))
+  double VP = TVVP*exp(ETA3);  // *exp(ETA(3))
+  double Q = TVQ;
+
+  // Infusion Duration (hours)
+  if(EVID == 1) last_dose = self.amt;  // capture latest dose
+  if(ceil(last_dose/1000) <= 1) {  // if dosage is less than or equal to 1g
+    D_CENT = 60/60;  // set infusion time to 60 minutes
+  } else if(ceil(last_dose/1500) <= 1) {  // if dosage less than or equal to 1.5g
+    D_CENT = 90/60;  // set infusion time to 90 minutes
+  } else if(ceil(last_dose/2000) <= 1) {  // if dosage less than or equal to 2g
+    D_CENT = 120/60;  // set infusion time to 120 minutes
+  } else {  // if infusion time more than 2g
+    D_CENT = self.amt/1000;  // set infusion time to 1g/hour
+  }
+
+$ODE  // Differential Equations
+  double C1 = CENT/VC;
+  double C2 = PERI/VP;
+
+  dxdt_CENT = C2*Q - C1*Q - C1*CL;
+  dxdt_PERI = C1*Q - C2*Q;
+  dxdt_AUC = C1;
+
+$TABLE  // Determines Values and Includes in Output	
+  double IPRE = C1;  // individual prediction
+  double DV = IPRE*(1 + EPS1*ERR_PRO) + EPS2*ERR_ADD;  // observed concentration
+  // double DV = IPRE*(1 + EPS(1)*ERR_PRO) + EPS(2)*ERR_ADD;  // debug
+
+$CAPTURE 
+  WT CRCL DIAL IPRE DV C2 CENT PERI AUC
+  CL VC VP Q COVCL COVVC
+  ETA1 ETA2 ETA3 EPS1 EPS2
+'
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+# Compile the model code
+  mod <- mrgsolve::mcode("vancPK", code)
+```
+
+This code can be found in the `model.R` script.
+
+### Population of Interest
+
+Given that the population pharmacokinetic model includes weight, creatinine
+clearance and dialysis status as covariates, these are what should be specified
+when defining the population of interest. If using observed data, then these are
+the demographic data that need to be extracted from the available data.
+
+While covariates can be sampled from random distributions, here the population
+of interest is simple. All patients are defined as having an average weight
+and not being on haemodialysis. Patients are assigned one of four values for
+creatinine clearance.
+
+```{r pop1}
+# Vancomycin PopPK Model Simulation - Population
+# ------------------------------------------------------------------------------
+# Create population of representative patients for simulations
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+# Define demographic data
+# Number of individuals
+  nid <- 4*10  # Number of individuals
+  ID <- 1:nid  # Sequence of individual ID's
+
+# Set seed used for random number generation (important for consistent results)
+  set.seed(123456)
+
+# Reference population
+# Weight - 79 kg (?) [33 - 255]
+# Creatinine Clearance - 62 (?) [4 - 150]
+# Haemodialysis - 18.5% on dialysis
+
+# Simulated population
+# Weight - 75 kg (fixed)
+# Creatinine Clearance - 100, 75, 50, 25 ml/min (four fixed groups)
+# Haemodialysis - 0% (all not on dialysis)
+  cov_tb <- tibble::tibble(
+    WT = rep(75, times = nid),
+    CRCL = rep(c(100, 75, 50, 25), each = nid/4),
+    DIAL = rep(0, times = nid)
+  )
+```
+
+The population also requires a description of the population parameter 
+variability. This is done by extracting the description of variability from the
+model and then using it to obtain random samples from a normal distribution.
+The code below is designed to work for any combination of OMEGA blocks (with
+and without correlation between parameter variability).
+
+Covariate and variability data are bound together into the resulting population
+dataset. This is in a subject-level format (one patient per line).
+
+```{r pop2}
+# Population parameter variability
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+# Extract omega block values from model and allocate individual distributions
+  eta_tb <- mrgsolve::omat(mod, make = TRUE) %>%
+    {MASS::mvrnorm(n = nid, mu = rep(0, dim(.)[1]), Sigma = .)} %>%
+    tibble::as_tibble() %>% 
+    dplyr::rename_all(function(x) paste0("ETA", readr::parse_number(x)))
+  
+# Create data frame of individuals with varying demographics and ETA values
+  pop_tb <- dplyr::bind_cols(ID = ID, cov_tb, eta_tb)
+```
+
+All of this code can be found in the `population.R` script.
+
+### Drug Regimen
+
+The drug regimen defines when doses are given to patients, in addition to times
+at which concentration predictions are desired (or are available with observed
+data). For a dosing simulation study, this is often referred to as the induction
+regimen as it is the part that is consistent between different dosing 
+strategies.
+
+Below shows the induction regiment for the vancomycin simulation study.
+Concentration times are relatively dense for plotting, and then later filtered
+to better represent blood sample times.
+
+```{r reg1}
+# Vancomycin PopPK Model Simulation - Induction Regimen
+# ------------------------------------------------------------------------------
+# Create simulation input dataset
+# Define time points
+  conc_times <- seq(from = 0, 24*7, by = 0.25)  # 1 day of half hourly data
+  freq_bd <- 12*0:14
+  freq_d <- c(0, 24*0:6 + 12)
+  amt_load <- 2000  # loading dose (mg)
+  amt_mnt1 <- 1500  # maintenence dose CrCL = 100 mL/min (mg)
+  amt_mnt2 <- 1000  # maintenence dose CrCL = 75 mL/min (mg) 
+  amt_mnt3 <- 750  # maintenence dose CrCL = 50 mL/min (mg) 
+  amt_mnt4 <- 1000  # maintenence dose CrCL = 25 mL/min (mg)
+  
+# Create concentration dataset
+  pk_tb <- tibble::tibble(
+    ID = rep(ID, each = length(conc_times)),
+    time = rep(conc_times, times = nid),
+    amt = 0,
+    cmt = 1,
+    evid = 0,
+    rate = 0
+  )
+  
+# Incorporate maintenance dose at dose times
+  dose_cols <- c("amt", "evid", "rate")
+  sub_mnt1 <- with(pk_tb, ID %in% 1:(nid/4) & time %in% freq_bd)
+  pk_tb[sub_mnt1, dose_cols] <- data.frame(amt = amt_mnt1, evid = 1, rate = -2)
+  
+  sub_mnt2 <- with(pk_tb, ID %in% (nid/4+1):(nid*2/4) & time %in% freq_bd)
+  pk_tb[sub_mnt2, dose_cols] <- data.frame(amt = amt_mnt2, evid = 1, rate = -2)
+  
+  sub_mnt3 <- with(pk_tb, ID %in% (nid*2/4+1):(nid*3/4) & time %in% freq_bd)
+  pk_tb[sub_mnt3, dose_cols] <- data.frame(amt = amt_mnt3, evid = 1, rate = -2)
+  
+  sub_mnt4 <- with(pk_tb, ID %in% (nid*3/4+1):nid & time %in% freq_d)
+  pk_tb[sub_mnt4, dose_cols] <- data.frame(amt = amt_mnt4, evid = 1, rate = -2)
+  
+# Define first dose as loading dose
+  pk_tb[pk_tb$time == 0, "amt"] <- amt_load  # loading dose
+```
+
+Much like in the population where the population variability was defined
+external from the model simulation, the observation variability (residual 
+unexplained variability/EPS samples from SIGMA distribution) should also be
+defined externally if using Bayesian forecasting. 
+
+As can be seen, it uses very similar code to that used for population 
+variability. The main difference is that random samples are taken from a normal
+distribution for each observation, rather than each subject.
+
+```{r reg2}
+# Residual unexplained variability
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+# Create residual unexplained variability dataset
+  input_dim <- nid*length(conc_times)
+  eps_tb <- mrgsolve::smat(mod, make = TRUE) %>%  # Omega matrix from model
+    {MASS::mvrnorm(n = input_dim, mu = rep(0, dim(.)[1]), Sigma = .)} %>%
+    tibble::as_tibble() %>%  # matrix used to sample from normal distribution
+    dplyr::rename_all(function(x) paste0("EPS", readr::parse_number(x)))
+  
+# Combine to make final input dataset
+  input_tb <- dplyr::bind_cols(pk_tb, eps_tb)
+```
+
+The model is then simulated using the code below. The population pharmacokinetic
+model is "piped" into each line. Effectively this provides instructions to the
+model: `data_set`, simulate this regimen; `idata_set`, with this population;
+`carry_out`, provide these columns as additional output.
+
+```{r sim1}
+# Simulate standard dosing regimen
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+# Pipe dataset to model
+  output_tb <- mod %>%
+    mrgsolve::data_set(input_tb) %>%  # set input data (observations/events)
+    mrgsolve::idata_set(pop_tb) %>%  # set individual data (sets ETAs)
+    mrgsolve::carry_out(amt, evid, rate, cmt) %>%  # copy to simulated output
+    mrgsolve::mrgsim() %>%  # simulate using mrgsolve
+    tibble::as_tibble()
+```
+
+Using this dataset, Bayesian estimation and forecasting will be demonstrated.
+Here is an example of the model output.
+
+```{r sim2, echo = F}
+  head(output_tb, 6)
+```
+
+```{r sim3, echo = FALSE, fig.width = 11.8, fig.height = 11.8}
+# Set ggplot2 theme
+  library(ggplot2)
+  theme_bw2 <- theme_set(theme_bw(base_size = 14))
+  theme_update(plot.title = element_text(hjust = 0.5))
+  
+  CI90lo <- function(x) quantile(x, probs = 0.05)
+  CI90hi <- function(x) quantile(x, probs = 0.95)
+
+# Plot individual patient vancomycin concentrations
+  p <- NULL
+  p <- ggplot(data = output_tb)
+  p <- p + stat_summary(aes(x = time, y = IPRE), geom = "line", fun.y = median,
+    colour = "red", size = 1)
+  p <- p + stat_summary(aes(x = time, y = IPRE), geom = "ribbon",
+    fun.ymin = CI90lo,  fun.ymax = CI90hi, fill = "red", size = 1, alpha = 0.25)
+  p <- p + labs(x = "Time (hours)", y = "Vancomycin Concentration (mg/L)")
+  p <- p + coord_cartesian(xlim = c(0, 72), ylim = NULL)
+  p <- p + facet_wrap(~CRCL)
+  p
+```
+
+This will typically be subset according to the blood samples that would be
+taken. As an example, blood samples may be taken just prior to dosing. Therefore
+using concentration predictions at dose times would be appropriate.
+
+If doing a simulation study, it's important keep the original ETA and EPS values
+as they are required for the simulations that occur between each round of dose
+optimisation. But there is also a requirement of being careful with these
+values, as these values are not known during use of Bayesian estimation
+or forecasting in practice.
+
+```{r sim4, echo = F}
+  output_tb %>%
+    dplyr::filter(evid == 1) %>%
+    dplyr::select(ID, time, amt, evid, rate, cmt, WT, CRCL, DIAL, DV, EPS1, EPS2) %>%
+    head()
+```
+
+All of this code can be found in the `regimen.R` script.
+
+## Empirical Bayesian Estimation
+
+Empirical Bayesian estimation (also known as _maximum a priori_ estimation),
+determines individual pharmacokinetic parameters by minimising a maximum 
+likelihood objective function. Sampled blood concentrations along with dose
+and covariate information is used (from observed or simulated data) along with
+a population pharmacokinetic model for estimation. 
+
+Estimation is undertaken by an optimisation algorithm (R base function `optim`).
+This minimises an objective function value as defined below. This provides 
+estimates that maximise the two following properties:
+
+* the likelihood that the difference between the observed concentration data 
+and the individual concentration predictions is described by the residual
+unexplained variability distribution of the model (posterior likelihood)
+* the likelihood that parameter estimates are sampled from the population
+parameter variability distribution as described by the model (prior likelihood)
+
+$$
+OFV = -ln \left( \sum_{i=1}^n \frac{
+    e^{ -\frac{
+      ( C_{trough,i} - \hat{C}_{trough,i} )^2
+    }{
+      2( \hat{C}_{trough,i} \sigma )^2
+    }}
+  }{
+    \sqrt{2\pi ( \hat{C}_{trough,i} \sigma )^2}
+  } + \sum_{k=1}^s \frac{
+    e^{ -\frac{ \eta_k^2 }{ 2 \omega_k^2 }}
+  }{
+    \sqrt{2 \pi \omega_k^2}
+  } \right)
+$$
+
+_where $OFV$ is the maximum likelihood objective function to be minimised, $n$
+is the number of plasma sample concentrations, $C_{trough,i}$, with $i = 1$ for
+the first sample and $i = n$ for the last available sample, $\hat{C}_{trough,i}$
+are the Bayesian predictions for each plasma sample concentration and $\sigma$ 
+is the vemurafenib pharmacokinetic model standard deviation for the residual 
+unexplained variability of measured concentrations. $s$ is the number of 
+pharmacokinetic parameters to be estimated with $k = 1$ for the first parameter 
+and $k = s$ for the final parameter, $\eta_k$ is the Bayesian predictions for 
+the random effect which reflects the difference between the individual's $k$th 
+parameter value and the population value, and $\omega_k$ is the vemurafenib 
+pharmacokineitc model standard deviation term for the inter-individual 
+variability for the $k$th parameter._
+
+### Single Patient Estimation
+
+As an example, the EBEs for a single patient are estimated in this section. The
+data available for this single patient is shown below.
+
+```{r ebe0}
+  single_tb <- output_tb %>%
+    dplyr::filter(evid == 1 & ID == 1 & time <= 72) %>%
+    dplyr::select(ID, time, amt, evid, rate, cmt, WT, CRCL, DIAL, DV)
+  single_tb
+```
+
+The two key parts of any optimisation algorithm are the initial parameters and
+the a function that provides a value to be minimised. When creating an 
+optimisation algorithm it can be useful to use an example of the parameters
+that will be provided to the function to ensure it is working properly. Below
+the line `bayes_estimate_fn <- function(par)` as well as it's opening and 
+closing brackets are commented out, while the debug lines starting with
+`par <- c(0.995, 0.996, 1.007)` is uncommented to show how the function works.
+
+First the predicted concentration that corresponds with the provided ETA values
+is determined.
+
+```{r ebe1}
+# Define bayesian estimation function
+  # bayes_estimate_fn <- function(par) {
+  # Debug:
+    par <- c(0.998, 0.999, 1.002)
+    ETABSV <- mrgsolve::omat(mod, make = TRUE) %>% diag()
+    prev_DV <- single_tb %>%
+      dplyr::pull(DV)
+  # Describe parameters to be optimised within mrgsolve data set
+  # Parameters are defined as `exp(ETA)`, log transform to get ETA value
+    ETA <- log(par)
+  # Determine predictions that correspond with these ETA values
+  # Define mrgsolve dataset
+    estim_tb <- single_tb %>%
+  # Remove DV column, not needed for simulation
+      dplyr::select(-DV) %>%
+  # This creates an ETA column for each value of ETA (1, 2, 3)
+  # The function is given the name of each ETA column as input
+  # It extracts the number from this column name, and then finds
+  # the corresponding value (ETA1, ETA2, ET3)
+      dplyr::mutate_at(paste0("ETA", 1:length(ETABSV)), function(x) {
+        eta <- as.numeric(substr(deparse(substitute(x)), 4, 4))
+        ETA[eta]
+      }) %>%
+      tibble::glimpse(width = 50) %>%
+  # Run data through mrgsolve, idata_set is not used, as population data is
+  # included in the longitudinal dataset
+  # The `.` in the data_set function tells the pipe to put the data in this 
+  # argument, rather than being the value of the first argument.
+      mrgsolve::data_set(x = mod, data = .) %>%
+      mrgsolve::carry_out(amt, evid, rate, cmt) %>% 
+      mrgsolve::mrgsim() %>%
+      tibble::as_tibble() %>% 
+  # Ensure IPRED has finite values
+  # This uses an if else statement to check if IPRE is not finite
+  # If IPRE being not finite is true, make it a very small number
+  # Otherwise IPRE can stay the same
+      dplyr::mutate(IPRE = dplyr::if_else(
+        condition = !is.finite(IPRE) | IPRE < .Machine$double.eps,
+        true = .Machine$double.eps,
+        false = IPRE
+      ))
+  # The output shows the structure of the data before simulation occurs
+  # The output below shows the structure of the simulated data
+    estim_tb
+  # As can be seen, `mrgsolve` has default simulation times, so it is important
+  # that only the values for IPRED that correspond with the DV values that are
+  # available. The IPRED values are referred to as `yhat` as they are 
+  # predictions of `y` (DV).
+  # Define yhat
+    sample_times <- dplyr::pull(single_tb, time)
+    yhat <- dplyr::filter(estim_tb, evid == 1 & time %in% sample_times) %>%
+      dplyr::pull(IPRE)
+    length(yhat) == length(prev_DV)
+```
+
+Now the that predicted concentrations that correspond with the provided ETA
+values has been determined, the objective function value can be determined. As
+shown above this has two parts. The first part, the posterior, requires:
+
+* observed concentration data
+* predicted concentration data (no RUV)
+* standard deviation for each observation
+
+The standard deviation is determined from the description of RUV from the popPK
+model. The value given for standard deviation is equivalent to what would be
+defined as the weight or `W` in some styles of NONMEM model definition. How this 
+value is determined depends on the RUV model type:
+
+* If the model has additive error, then this value will be the same for 
+each value as the error does not change between observations
+    + NONMEM: `DV = IPRED + ERR_ADD*EPS(1)`
+    + NONMEM: `W = ERR_ADD;  DV = IPRE + W*EPS(1)`
+    + R: `loglikpost_sd <- mod$ERR_ADD`
+* If the model has proportional error, then this value will be dependent on the
+value of `yhat`
+    + NONMEM: `DV = IPRED*(1 + ERR_PRO*EPS(1))`
+    + NONMEM: `W = IPRED*ERR_PRO;  DV = IPRE + W*EPS(1)`
+    + R: `loglikpost_sd <- yhat*mod$ERR_PRO`
+* If the model has additive and proportional error, then this value will be 
+dependent on the value of `yhat` but also needs to incorporate the additve error
+    + NONMEM: `IPRED*(1 + ERR_PRO*EPS(1)) + ERR_ADD*EPS(2)`
+    + NONMEM: `W = SQRT((IPRED*ERR_PRO)**2 + ERR_ADD**2);  DV = IPRE + W*EPS(1)`
+    + R: `loglikpost_sd <- sqrt((yhat*mod$ERR_PRO)^2 + mod$ERR_ADD^2)`
+    
+The vancomycin model has additive and proportional error, so the weight is 
+calculated accordingly. 
+
+In this case the log-likelihood function `dnorm(..., log = T)` determines the 
+likelihood (given as a log value) that the observed data `prev_DV` was sampled 
+from a normal distribution with a mean equal to the predicted concentration
+`yhat` and standard deviation equal to the weight for that prediction given by
+the model `loglikpost_sd`.
+
+```{r ebe2}
+  # Posterior log-likelihood
+  # Error model: IPRE*(1 + ERR_PRO) + ERR_ADD
+  # Can be simplified to: IPRE + W*ERR
+  # Where W = sqrt(pow(IPRE*ERR_PRO, 2) + pow(ERR_ADD, 2))
+    loglikpost_sd <- sqrt((yhat*mod$ERR_PRO)^2 + mod$ERR_ADD^2)
+    loglikpost <- dnorm(prev_DV, mean = yhat, sd = loglikpost_sd, log = T)
+    loglikpost
+```
+
+The second part of the objective function value is the prior log-likelihood.
+In this case the log-likelihood function determines the likelihood (given as a 
+log value) that the given estimate of ETA `log(par)` was sampled from a normal 
+distribution with a mean equal to zero and standard deviation equatl to the 
+square root of the population parameter variability as defined by the model
+`ETABSV`.
+
+The sum of the two parts are found, and the negative of the value is found. This
+is because we want to maximise the likelihood, but the optimisation algorithm
+is designed to minimise a value. By making the objective function value the 
+inverse of the likelihood, we minimise the objective function value while 
+maximising the likelihood.
+
+```{r ebe3}
+  # Prior log-likelihood
+    loglikprior <- dnorm(ETA, mean = 0, sd = sqrt(ETABSV), log = T)
+    loglikprior
+  # Return objective function value to be minimised
+    -1*sum(loglikpost, loglikprior)
+  # }  # end bayes_estimate_fn
+```
+
+It should be noted that there are 6 values for the posterior likelihood, but 
+only 3 values for the prior likelihood. This is an inherent property of EBEs.
+When data is sparse, the estimates prioritise maximising the prior likelihood.
+As more data is available, the priority shits more to the posterior likelihood.
+
+These processes make up the function that will be used with the optimisation
+algorithm function `optim()`.
+
+```{r ebe4}
+  bayes_estimate_fn <- function(par) {
+  # Describe parameters to be optimised within mrgsolve data set
+    ETA <- log(par)
+  # Define mrgsolve dataset
+    estim_tb <- single_tb %>%
+      dplyr::select(-DV) %>%
+      dplyr::mutate_at(paste0("ETA", 1:length(ETABSV)), function(x) {
+        eta <- as.numeric(substr(deparse(substitute(x)), 4, 4))
+        ETA[eta]
+      }) %>%
+    # Run data through mrgsolve, with idata using initial tumour size
+      mrgsolve::data_set(x = mod, data = .) %>%
+      mrgsolve::carry_out(amt, evid, rate, cmt) %>% 
+      mrgsolve::mrgsim() %>%
+      tibble::as_tibble() %>% 
+    # Ensure IPRED has finite values
+      dplyr::mutate(IPRE = dplyr::if_else(
+        !is.finite(IPRE) | IPRE < .Machine$double.eps,
+        .Machine$double.eps,
+        IPRE
+      ))
+  # Define yhat
+    sample_times <- dplyr::pull(single_tb, time)
+    yhat <- dplyr::filter(estim_tb, evid == 1 & time %in% sample_times) %>%
+      dplyr::pull(IPRE)
+  # Posterior log-likelihood
+  # Error model: IPRE*(1 + ERR_PRO) + ERR_ADD
+  # Can be simplified to: IPRE + W*ERR
+  # Where W = sqrt(pow(IPRE*ERR_PRO, 2) + pow(ERR_ADD, 2))
+    loglikpost_sd <- sqrt((yhat*mod$ERR_PRO)^2 + mod$ERR_ADD^2)
+    loglikpost <- dnorm(prev_DV, mean = yhat, sd = loglikpost_sd, log = T)
+  # Prior log-likelihood
+    loglikprior <- dnorm(ETA, mean = 0, sd = sqrt(ETABSV), log = T)
+  # Return objective function value to be minimised
+    return(-1*sum(loglikpost, loglikprior))
+  }  # end bayes_estimate_fn
+```
+
+When using the `optim` function, the following arguments are used:
+
+* `par` - initial parameters to be optimised: `init_par`
+* `fn` - function to be minimised: `bayes_estimate_fn`
+* `method` - function that minimises `fn`: `"L-BFGS-B"`
+    + there are a large number of methods available, L-BFGS-B is used here as it
+      is well suited to the given problem, and allows the use of upper and lower
+      boundaries for parameters
+* `lower` & `upper` - bounds on parameter values: `0.001 - 1000`
+    + must provide `lower` and `upper` bounds for each parameter value, in this
+      case we use the same bound for each parameter
+* `control` - a list of control parameters
+    + `parscale` & `fnscale` - scaling for parameter or function values 
+      `par/parscale` `fn(par)/fnscale`, the initial values are used so that the
+      relative parameter and relative objective function value is calculated
+    + `factr` & `pgtol` - change the tolerance for convergence
+
+```{r ebe5}
+# Define initial parameters
+  init_par <- exp(double(length(ETABSV)))
+  init_par
+# Run bayes_estimate_fn using optim()
+  bayes_estimate <- optim(init_par, bayes_estimate_fn, method = "L-BFGS-B",
+    lower = rep(0.001, times = length(ETABSV)), 
+    upper = rep(1000, times = length(ETABSV)),
+    control = list(
+      parscale = init_par, fnscale = bayes_estimate_fn(init_par),
+      factr = 1e12, pgtol = 1e-8
+    )
+  )
+  bayes_estimate
+```
+
+The output shows:
+
+* `$par` - the final parameter estimates
+* `$value` - the final value of the objective function value
+* `$counts` - number of times the function and gradient function were computed
+* `$convergence` - convergence status (0 is successful)
+* `$message` - character string providing additional info from the optimiser
+
+When using the `"L-BFGS-B" method the convergence message that you want is
+`"CONVERGENCE: REL_REDUCTION_OF_F <= FACTR*EPSMCH"`. Any other message can mean
+that something was not quite right with that optimisation.
+
+### Multiple Patient Estimation
+
+The advantage of using a programming language like R is that we can run the same
+process for multiple different cases, without writing the same thing for each
+specific patient. When applying a general function to multiple different 
+patients it is important to ensure that the function works correctly for all
+patients. Rather than specifically going through each patient, it can be 
+beneficial to set up the function in a way that checks it for you.
+
+This section will go through a Bayes function that is run on multiple patients.
+It should be noted that the additional components have been added to the 
+process to be run for each patient. 
+
+* Section 1: Prepare function environment
+* Section 2: Same as single patient, but:
+    + now wrapped in a repeat function, designed to repeat the process with
+      different initial parameters if optimisation is unsuccessful
+    + sucess of optimisation is determined by whether the `optim` output 
+      `$message` shows that convergence was successful
+    + now runs `optim` inside a `try` function, therefore if there is an error
+      which would cause R to completely stop and lose all output, instead a new
+      set of initial parameters can be trialled, could also be used for debug
+      purposes
+    + counts the number of repeated runs `run_num`, so that initial parameters
+      are changed, could also be used for debug purposes
+* Section 3: Simulate concentrations using optimised EBEs
+
+```{r ebe6}
+  ebe_fn <- function(bayesin_tb) {
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  #### SECTION 1 ####
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  # Debug:
+    # bayesin_tb <- dplyr::filter(output_tb, ID == 1) %>% dplyr::rename(ID2 = ID)
+  # Change ID2 column name to ID and determine final time
+    # bayesin_tb <- dplyr::rename(bayesin_tb, ID = ID2)  # remove if using ddply
+  # Determine sample time and sample concentration
+    sample_time <- dplyr::filter(bayesin_tb, evid != 0) %>%
+      dplyr::pull(time)
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  #### SECTION 2 ####
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  # Empirical Bayesian Estimation
+  # Loop until successful minimisation
+    run_num <- 0
+    repeat {
+    # Initial estimates for Bayes parameters
+      ETABSV <- mrgsolve::omat(mod, make = TRUE) %>% diag()
+      n_eta <- length(ETABSV)
+      init_par <- exp(double(n_eta))
+      if (run_num > 0) {
+        init_par <- init_par*exp(runif(n_eta, min = -0.01, max = 0.01))
+      }
+    # Previous dependent variable values
+      prev_DV <- dplyr::filter(bayesin_tb, time %in% sample_time) %>% 
+        dplyr::pull(DV)
+    # Define bayesian estimation function
+      bayes_estimate_fn <- function(par) {
+      # Describe parameters to be optimised within mrgsolve data set
+        ETA <- log(par)
+      # Define mrgsolve dataset
+        estim_tb <- bayesin_tb %>%
+          dplyr::select(ID, time, evid, amt, cmt, rate, WT, DIAL, CRCL) %>%
+          dplyr::mutate_at(paste0("ETA", 1:n_eta), function(x) {
+            eta <- as.numeric(substr(deparse(substitute(x)), 4, 4))
+            ETA[eta]
+          }) %>%
+        # Run data through mrgsolve, with idata using initial tumour size
+          mrgsolve::data_set(x = mod, data = .) %>%
+          mrgsolve::carry_out(amt, evid, rate, cmt) %>% 
+          mrgsolve::mrgsim() %>%
+          tibble::as_tibble() %>% 
+        # Ensure IPRED has finite values
+          dplyr::mutate(IPRE = dplyr::if_else(
+            !is.finite(IPRE) | IPRE < .Machine$double.eps,
+            .Machine$double.eps,
+            IPRE
+          ))
+      # Define yhat
+        yhat <- dplyr::filter(estim_tb, evid == 1 & time %in% sample_time) %>%
+          dplyr::pull(IPRE)
+      # Posterior log-likelihood
+      # Error model: IPRE*(1 + ERR_PRO) + ERR_ADD
+      # Can be simplified to: IPRE + W*ERR
+      # Where W = sqrt(pow(IPRE*ERR_PRO, 2) + pow(ERR_ADD, 2))
+        loglikpost_sd <- sqrt((yhat*mod$ERR_PRO)^2 + mod$ERR_ADD^2)
+        loglikpost <- dnorm(prev_DV, mean = yhat, sd = loglikpost_sd, log = T)
+      # Prior log-likelihood
+        loglikprior <- dnorm(ETA, mean = 0, sd = sqrt(ETABSV), log = T)
+      # Return objective function value to be minimised
+        return(-1*sum(loglikpost, loglikprior))
+      }  # end bayes_estimate_fn
+    # Run bayes_estimate_fn using optim()
+      bayes_estimate <- try(optim(init_par, bayes_estimate_fn, method = "L-BFGS-B",
+        lower = rep(0.001, times = n_eta), upper = rep(1000, times = n_eta),
+        control = list(
+          parscale = init_par, fnscale = bayes_estimate_fn(init_par),
+          factr = 1e12, pgtol = 1e-8
+        )
+      ))
+      minimised <- "CONVERGENCE: REL_REDUCTION_OF_F <= FACTR*EPSMCH"
+      if (class(bayes_estimate) != "try-error") {
+        if (bayes_estimate$message == minimised) break
+      }
+      run_num <- run_num + 1
+    }  # end loop as successful minimisation has occurred
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  #### SECTION 3 ####
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  # Calculate concentrations according to new Bayes estimates.
+    input_sim_tb <- bayesin_tb %>%
+      dplyr::select(ID, time, evid, amt, cmt, rate, WT, DIAL, CRCL) %>%
+      dplyr::mutate_at(paste0("ETA", 1:n_eta), function(x) {
+        eta <- as.numeric(substr(deparse(substitute(x)), 4, 4))
+        log(bayes_estimate$par[eta])
+      })
+    output_sim_tb <- input_sim_tb %>%
+      dplyr::filter(time %in% sample_time) %>%
+      mrgsolve::data_set(x = mod, data = .) %>%
+      mrgsolve::carry_out(amt, evid, rate, cmt) %>% 
+      mrgsolve::mrgsim() %>%
+      tibble::as_tibble()
+    return(output_sim_tb)
+  }  # brackets closing "bayes_fn"
+```
+
+This function can be run using `plyr` or `purrr` packages. If either package is
+loaded using `library`, then namespace do not need to be defined (e.g. 
+`package::function` without package loaded, `function` when loaded). 
+
+```{r ebe7, eval = F}
+# plyr notation
+  ebe_tb <- plyr::ddply(output_tb, plyr::.(ID), ebe_fn)
+
+# purrr notation
+  ebe_tb <- output_tb %>%
+  { tibble::add_column(., ID2 = .$ID) } %>%  # so that ID is carried inside
+    dplyr::group_by(ID) %>% tidyr::nest() %>%  # create list column for ID data
+    dplyr::mutate(bayes = purrr::map(data, ebe_fn))  # ddply
+    tidyr::unnest()
+```
+
+The resulting output will have the EBEs and the simulated predictions that 
+correspond with those estimates. Estimates can be evaluated by comparing the
+distribution of estimated parameters against model distributions, calculating
+shrinkage and using general model diagnostic plots.
+
+## Bayesian Forecasting
+
+Bayesian forecasting takes this process a step further, where it uses these EBEs
+to predict what will occur following future events. Using the example of 
+estimating individual parameters for a single patient, this section will show
+how future doses can then be optimised to maximise efficacy and minimise
+toxicity.
+
+### Single Patient Forecasting
+
+First, like section 3 of determining the EBEs, as simulation using the EBEs will
+be utilised to get predictions for Bayesian forecasting.
+
+```{r bf1}
+  input_sim_tb <- output_tb %>%
+    dplyr::filter(evid == 1 & ID == 1) %>%
+    dplyr::select(ID, time, evid, amt, cmt, rate, WT, DIAL, CRCL) %>%
+    dplyr::mutate_at(paste0("ETA", 1:length(ETABSV)), function(x) {
+      eta <- as.numeric(substr(deparse(substitute(x)), 4, 4))
+      log(bayes_estimate$par[eta])
+    })
+  output_sim_tb <- input_sim_tb %>%
+    dplyr::filter(time %in% sample_times) %>%
+    mrgsolve::data_set(x = mod, data = .) %>%
+    mrgsolve::carry_out(amt, evid, rate, cmt) %>% 
+    mrgsolve::mrgsim() %>%
+    tibble::as_tibble()
+```
+
+Using this simulation and a pre-existing target metric a dose can be optimised.
+Vancomycin has a threshold for efficacy of 400 mg.h/L, while an AUC of 700
+mg.h/L is associated with toxicity. Therefore the AUC over the last 24 hours is
+determined. If it is within the range, then no changes to dose is required.
+Otherwise, the dose should be optimised.
+
+Before this, a few objects require defining. These would typically be defined
+at the beginning of the function for each individual.
+
+```{r bf2}
+# Define the final time of the simulation study
+  final_time <- tail(output_tb, 1) %>% dplyr::pull(time)
+# Determine all sample times so far
+  sample_all <- sample_times
+# Determine latest sample time
+  sample_time <- dplyr::filter(single_tb, evid != 0) %>%
+    tail(1) %>%
+    dplyr::pull(time)
+# Determine previous dose and frequency
+  last_amt <- dplyr::filter(output_tb, ID == 1 & time == sample_time) %>%
+    dplyr::pull(amt)
+  last_frq <- dplyr::filter(output_tb, ID == 1 & evid != 0 & time >= sample_time) %>%
+    dplyr::pull(time) %>% diff() %>% unique()
+# Determine AUC
+  last_bayes_auc <- output_sim_tb %>%
+    dplyr::filter(time %in% c(sample_time - 24, sample_time)) %>%
+    dplyr::pull(AUC) %>% diff()
+  last_bayes_auc
+# Is the AUC high enough to require another concentration sample in 24 hours?
+  sample_next <- dplyr::if_else(last_bayes_auc >= 800, 24, 72)
+# Next sample time
+  next_time <- sample_time + sample_next
+  next_time
+# Define trough target and upper bound
+  auc_lower <- 400
+  auc_target <- 500
+  auc_upper <- 700
+```
+
+This shows that the AUC is predicted to have been acceptable in the last 24 
+hours. Therefore the next sample should be taken in 72 hours. As an example
+it will be assumed that the AUC is not acceptable and that dose optimisation
+is required. 
+
+Below the if statement usually surrounding the optimisation step is commented
+out. First a dose optimisation model is defined. This model has the initial
+conditions changed to the most recent sample time. This makes the concentration
+in the central, peripheral and AUC compartments start at the correct value.
+
+```{r bf3}
+# if (last_bayes_auc < auc_lower | last_bayes_auc >= auc_upper | last_amt == 0) {
+# Modify model code ready for simulation
+  optim_mod <- mrgsolve::init(mod, list(
+    CENT = dplyr::filter(output_sim_tb, time == sample_time) %>% 
+      dplyr::pull(CENT),
+    PERI = dplyr::filter(output_sim_tb, time == sample_time) %>% 
+      dplyr::pull(PERI),
+    AUC = dplyr::filter(output_sim_tb, time == sample_time) %>% 
+      dplyr::pull(AUC)
+  ))
+```
+
+The dose will be optimised using the same algorithm seen in the Bayesian 
+estimation step. Therefore the initial parameter should be defined, as well
+as a unique function that provides the objective function value that will be
+minimised.
+
+In this case the dataset that is created for the objective function value 
+function consists of data from the latest sample time, through to the next 
+sample time. This is used to simulate what the concentrations will be between
+those times, using the `optim_mod` which has initial conditions set to 
+the latest sample time. 
+
+The dose is the parameter to be optimised in the function, so for each new
+value of dose, predictions are made, which are used to calculate the AUC prior
+to the next sample. 
+
+In this case the log-likelihood function `dnorm(..., log = T)` determines the 
+likelihood (given as a log value) that the target AUC `auc_target` could be 
+sampled from a normal distribution with a mean equal to the predicted AUC `yhat`
+and standard deviation equal to the optimised sigma value `par[2]`. Here the
+value for sigma is multiplied by `yhat` assuming proportional error (higher
+error at higher AUC values).
+
+```{r bf4}
+# Set initial dose and error estimates
+  init_par <- c(1000, 0.01)
+# Subset input dataset so only future concentrations are predicted
+  test_times <- seq(sample_time, final_time, by = last_frq)
+  input_optim_tb <- input_sim_tb %>% 
+    dplyr::filter(time >= sample_time & time <= next_time) %>%
+    dplyr::mutate(
+      evid = dplyr::if_else(time %in% test_times, 1, 0),
+      rate = dplyr::if_else(evid != 0, -2, 0)
+    )
+# Find the doses that maximise the likelihood of trough concentrations
+#   being the target concentration
+  optimise_dose_fn <- function(par) {
+  # Add fitted parameters to the input data set, then simulate 
+  #   concentration-time profiles with fitted doses
+    output_optim_tb <- input_optim_tb %>%
+      dplyr::mutate(amt = dplyr::if_else(
+        evid == 1, par[1], amt
+      )) %>%
+      mrgsolve::data_set(x = optim_mod, data = .) %>%
+      mrgsolve::carry_out(amt, evid, rate, cmt) %>% 
+      mrgsolve::mrgsim(start = sample_time, end = next_time) %>%
+      tibble::as_tibble() %>%
+      dplyr::mutate(IPRE = dplyr::if_else(
+        !is.finite(IPRE) | IPRE < .Machine$double.eps,
+        .Machine$double.eps,
+        IPRE
+      )) %>%
+      dplyr::filter(evid != 1)
+  # Define yhat and the residual
+    yhat <- output_optim_tb %>%
+      dplyr::filter(time %in% c(next_time - 24, next_time)) %>%
+      dplyr::pull(AUC) %>% diff()
+    res <- dnorm(auc_target, yhat, yhat*par[2], log = T)
+  # Objective function value to be minimised
+    return(-1*sum(res))
+  }
+  optimise_dose <- try(optim(init_par, optimise_dose_fn, method = "L-BFGS-B",
+    lower = c(0.0001, 0.0001),
+    upper = c(5000, Inf),
+    control = list(parscale = init_par, factr = 1e7)
+  ))
+# Administer the individual the optimised dose
+  exact_amt <- optimise_dose$par[1]
+```
+
+The resulting dose is added to the original dataset and the resulting 
+concentration simulated. Note that the original values for EPS are brought back
+into the dataset. This is aimed particularly at simulation studies, where these
+simulated values will provide the DV values for the next round of Bayesian
+estimation, forecasting and dose optimisation.
+
+```{r bf5}
+# Simulate new dataset 
+  input_final_tb <- output_tb %>%
+    dplyr::filter(ID == 1) %>%
+    dplyr::mutate(amt = dplyr::if_else(
+      time >= sample_time & evid == 1, exact_amt, amt
+    )) %>%
+    dplyr::select(ID, time, evid, amt, cmt, rate, EPS1, EPS2)
+# Print new input dataset
+  dplyr::filter(input_final_tb, time >= 72 & evid == 1)
+# Simulate to represent time passing since last sample
+  bayesout_tb <- mod %>%
+    mrgsolve::data_set(data = input_final_tb) %>%
+    mrgsolve::idata_set(data = pop_tb) %>%
+    mrgsolve::carry_out(amt, evid, rate, cmt) %>%
+    mrgsolve::mrgsim() %>%
+    tibble::as_tibble()
+```
+
+At this stage, as mentioned above, the process would be repeated until the 
+optimised doses are beyond the final time of the simulation study.
+
+### Multiple Patient Forecasting
+
+Similar to obtaining EBEs, the use of Bayesian forecasting on a large scale is
+useful for simulation studies. Once again, functions that are run on multiple
+patients need to be able to adapt to different issues.
+
+For example, if the AUC is within the target range, the same dose can be used.
+Another example, would be to change the dosing frequency if the dose was too
+high or too low. For an example how the a full scale function works refer to 
+the accompanying R code named `bayes.R`.
